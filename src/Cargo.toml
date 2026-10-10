@@ -1,0 +1,13 @@
+[package]
+name = "disponibilizador"
+version = "1.0.0"
+edition = "2021"
+description = "Serve apenas a pasta 'compartilhar' para download na rede local / VMs"
+
+[dependencies]
+# Nenhuma dependência externa: só a biblioteca padrão do Rust.
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
