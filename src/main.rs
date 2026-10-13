@@ -5,13 +5,17 @@
 //! Nada fora dela é acessível: `../`, links simbólicos, caminhos absolutos
 //! e arquivos ocultos são bloqueados. Apenas leitura (GET/HEAD).
 //!
+//! O acesso exige um PIN de 4 dígitos, mostrado no console. Depois de
+//! PIN_MAX_ERROS erros o PIN é trocado por outro e as tentativas ficam
+//! bloqueadas por PIN_BLOQUEIO.
+//!
 //! Uso:
 //!   cargo run --release
 //!   cargo run --release -- --porta 9000
 //!   cargo run --release -- --host 192.168.56.1   (escutar só em uma interface)
-//!   cargo run --release -- --token auto          (exige token; gera um aleatório)
-//!   cargo run --release -- --token segredo123    (exige este token)
+//!   cargo run --release -- --sem-pin             (acesso livre, sem PIN)
 
+use std::collections::HashSet;
 use std::collections::hash_map::RandomState;
 use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
@@ -19,7 +23,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,7 +32,16 @@ const CHUNK: usize = 256 * 1024;
 const MAX_CONEXOES: usize = 128;
 /// Tempo total para o cliente enviar o cabeçalho inteiro (contra slowloris).
 const PRAZO_CABECALHO: Duration = Duration::from_secs(10);
-const COOKIE: &str = "token_disponibilizador";
+const COOKIE: &str = "sessao_disponibilizador";
+/// Começa com '.', então `resolver` nunca a confunde com um arquivo da pasta.
+const ROTA_PIN: &str = "/.entrar";
+/// Erros tolerados; o erro seguinte troca o PIN.
+const PIN_MAX_ERROS: u32 = 4;
+/// Espera a cada PIN errado. Como acontece com a trava do PIN segura,
+/// limita o chute a 1 por segundo no servidor inteiro.
+const PIN_PAUSA_ERRO: Duration = Duration::from_secs(1);
+/// Depois de trocar o PIN, ninguém tenta de novo por este tempo.
+const PIN_BLOQUEIO: Duration = Duration::from_secs(30);
 static ATIVAS: AtomicUsize = AtomicUsize::new(0);
 
 struct Guarda;
@@ -133,26 +146,43 @@ fn iguais(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Só caracteres que dispensam escape em URL e em cookie.
-fn token_valido(t: &str) -> bool {
-    !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+/// Número aleatório. Cada `RandomState` nasce com chaves SipHash sorteadas
+/// pelo sistema operacional, então o hash de nada já é imprevisível.
+fn aleatorio() -> u64 {
+    RandomState::new().build_hasher().finish()
 }
 
-/// 32 caracteres hex imprevisíveis. Cada `RandomState` nasce com chaves
-/// SipHash sorteadas pelo sistema operacional, então o hash é aleatório.
-fn gerar_token() -> String {
-    (0..2)
-        .map(|_| format!("{:016x}", RandomState::new().build_hasher().finish()))
-        .collect()
+/// 32 caracteres hex imprevisíveis, para identificar sessões.
+fn gerar_id() -> String {
+    format!("{:016x}{:016x}", aleatorio(), aleatorio())
 }
 
-/// Valor de um parâmetro da query string (`?t=...`), já decodificado.
-fn parametro(alvo: &str, nome: &str) -> Option<String> {
-    let query = alvo.split_once('?')?.1.split('#').next()?;
-    query
-        .split('&')
+/// PIN de 4 dígitos, sempre diferente do anterior.
+fn gerar_pin(anterior: Option<&str>) -> String {
+    loop {
+        let p = format!("{:04}", aleatorio() % 10_000);
+        if Some(p.as_str()) != anterior {
+            return p;
+        }
+    }
+}
+
+/// Valor de um campo de formulário (`pin=1234&volta=%2F`), já decodificado.
+fn campo(form: &str, nome: &str) -> Option<String> {
+    form.split('&')
         .find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == nome).map(|(_, v)| v))
-        .and_then(decodificar_url)
+        .and_then(|v| decodificar_url(&v.replace('+', " ")))
+}
+
+/// Para onde voltar depois do PIN. Só caminhos locais: nada de `//outro.site`
+/// (redirecionamento aberto) nem caracteres de controle (injeção de cabeçalho).
+fn destino_seguro(v: &str) -> String {
+    let ok = v.starts_with('/')
+        && !v.starts_with("//")
+        && !v.starts_with("/\\")
+        && v != ROTA_PIN
+        && v.bytes().all(|b| b > b' ' && b != 0x7f);
+    if ok { v.to_string() } else { "/".to_string() }
 }
 
 /// Valor de um cookie dentro do cabeçalho `Cookie: a=1; b=2`.
@@ -170,6 +200,8 @@ struct Req {
     range: Option<String>,
     if_range: Option<String>,
     cookie: Option<String>,
+    /// Corpo do POST (formulário do PIN); vazio nos demais métodos.
+    corpo: String,
 }
 
 /// Lado de saída da conexão. Lembra o status e conta os bytes do corpo, para o log.
@@ -190,10 +222,20 @@ impl Write for Resposta {
     }
 }
 
-/// Configuração compartilhada entre as threads.
+/// Configuração e estado compartilhados entre as threads.
 struct Config {
     raiz: PathBuf,
-    token: Option<String>,
+    /// `None` com `--sem-pin`.
+    pin: Option<Mutex<EstadoPin>>,
+    /// Sessões de quem já acertou o PIN. Sobrevivem à troca do PIN, então
+    /// alguém errando de propósito não derruba quem já entrou.
+    sessoes: Mutex<HashSet<String>>,
+}
+
+/// Trava ignorando envenenamento: o estado continua válido mesmo se outra
+/// thread entrou em pânico segurando a trava.
+fn travar<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Leitor que falha quando o prazo total acaba, não importa quão devagar
@@ -225,7 +267,7 @@ fn ler_requisicao(stream: &TcpStream) -> Option<Req> {
     let mut p = linha.split_whitespace();
     let metodo = p.next()?.to_string();
     let alvo = p.next()?.to_string();
-    let (mut range, mut if_range, mut cookie) = (None, None, None);
+    let (mut range, mut if_range, mut cookie, mut tam_corpo) = (None, None, None, 0usize);
     for _ in 0..100 {
         let mut h = String::new();
         if r.read_line(&mut h).ok()? == 0 {
@@ -233,14 +275,25 @@ fn ler_requisicao(stream: &TcpStream) -> Option<Req> {
         }
         let h = h.trim_end();
         if h.is_empty() {
-            return Some(Req { metodo, alvo, range, if_range, cookie });
+            // só o formulário do PIN usa corpo; 1 KB sobra
+            let mut corpo = String::new();
+            if metodo == "POST" {
+                if tam_corpo > 1024 {
+                    return None;
+                }
+                let mut b = vec![0u8; tam_corpo];
+                r.read_exact(&mut b).ok()?;
+                corpo = String::from_utf8(b).ok()?;
+            }
+            return Some(Req { metodo, alvo, range, if_range, cookie, corpo });
         }
         let Some((k, v)) = h.split_once(':') else { continue };
-        let v = Some(v.trim().to_string());
+        let v = v.trim();
         match k.trim().to_ascii_lowercase().as_str() {
-            "range" => range = v,
-            "if-range" => if_range = v,
-            "cookie" => cookie = v,
+            "range" => range = Some(v.to_string()),
+            "if-range" => if_range = Some(v.to_string()),
+            "cookie" => cookie = Some(v.to_string()),
+            "content-length" => tam_corpo = v.parse().ok()?,
             _ => {}
         }
     }
@@ -379,20 +432,177 @@ fn listar(s: &mut Resposta, dir: &Path, raiz: &Path, bruto: &str, head: bool) ->
         linhas.push_str("<tr><td colspan=\"2\"><em>Pasta vazia.</em></td></tr>");
     }
 
-    let corpo = format!(
-        "<!doctype html><html lang=\"pt-br\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<title>Compartilhar</title><style>\
-body{{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}}\
-a{{color:#7cc4ff;text-decoration:none}}a:hover{{text-decoration:underline}}\
-table{{width:100%;border-collapse:collapse}}td{{padding:.5rem;border-bottom:1px solid #333}}\
-td:last-child{{text-align:right;color:#aaa;white-space:nowrap}}\
-</style></head><body><h2>Arquivos disponíveis</h2>\
-<p style=\"color:#aaa\">{}</p><table>{}</table></body></html>",
-        escapar_html(&url),
-        linhas
+    let corpo = pagina(
+        "Compartilhar",
+        &format!(
+            "<h2>Arquivos disponíveis</h2><p class=\"fraco\">{}</p><table>{}</table>",
+            escapar_html(&url),
+            linhas
+        ),
     );
     responder_html(s, 200, "OK", &corpo, head)
+}
+
+const ESTILO: &str = "\
+body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}\
+a{color:#7cc4ff;text-decoration:none}a:hover{text-decoration:underline}\
+table{width:100%;border-collapse:collapse}td{padding:.5rem;border-bottom:1px solid #333}\
+td:last-child{text-align:right;color:#aaa;white-space:nowrap}\
+.fraco{color:#aaa}.aviso{color:#ffb86b}\
+form{display:flex;gap:.5rem;margin-top:1rem}\
+input{font:inherit;font-size:1.6rem;letter-spacing:.4em;width:6.5em;padding:.4rem .6rem;\
+background:#1b1b1b;color:#eee;border:1px solid #444;border-radius:6px;text-align:center}\
+button{font:inherit;padding:.4rem 1.2rem;background:#7cc4ff;color:#111;border:0;border-radius:6px;cursor:pointer}";
+
+/// Página HTML completa com o estilo comum.
+fn pagina(titulo: &str, conteudo: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"pt-br\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>{}</title><style>{}</style></head><body>{}</body></html>",
+        titulo, ESTILO, conteudo
+    )
+}
+
+// ───────────── acesso por PIN ─────────────
+
+struct EstadoPin {
+    pin: String,
+    /// Erros desde a última troca de PIN.
+    erros: u32,
+    bloqueado_ate: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Tentativa {
+    Certo,
+    /// Quantos erros ainda cabem antes da troca (contando o que troca).
+    Errado { restam: u32 },
+    /// Errou demais: PIN novo e bloqueio de PIN_BLOQUEIO.
+    Trocado,
+    /// Ainda dentro do bloqueio; nem confere o PIN.
+    Bloqueado(Duration),
+}
+
+impl EstadoPin {
+    fn novo() -> Self {
+        EstadoPin { pin: gerar_pin(None), erros: 0, bloqueado_ate: None }
+    }
+
+    fn tentar(&mut self, chute: &str, agora: Instant) -> Tentativa {
+        if let Some(ate) = self.bloqueado_ate {
+            if agora < ate {
+                return Tentativa::Bloqueado(ate - agora);
+            }
+            self.bloqueado_ate = None;
+        }
+        if iguais(chute, &self.pin) {
+            return Tentativa::Certo;
+        }
+        self.erros += 1;
+        if self.erros > PIN_MAX_ERROS {
+            self.pin = gerar_pin(Some(&self.pin));
+            self.erros = 0;
+            self.bloqueado_ate = Some(agora + PIN_BLOQUEIO);
+            Tentativa::Trocado
+        } else {
+            Tentativa::Errado { restam: PIN_MAX_ERROS + 1 - self.erros }
+        }
+    }
+}
+
+fn sessao_valida(req: &Req, cfg: &Config) -> bool {
+    req.cookie
+        .as_deref()
+        .and_then(|c| valor_cookie(c, COOKIE))
+        .is_some_and(|id| travar(&cfg.sessoes).contains(id))
+}
+
+/// Formulário do PIN. `volta` é para onde ir depois de acertar
+/// (a pasta ou o arquivo que a pessoa tentou abrir).
+fn pagina_pin(s: &mut Resposta, msg: &str, volta: &str, head: bool) -> io::Result<()> {
+    let aviso = if msg.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"aviso\">{}</p>", escapar_html(msg))
+    };
+    let corpo = pagina(
+        "PIN de acesso",
+        &format!(
+            "<h2>PIN de acesso</h2>\
+<p class=\"fraco\">Digite o PIN de 4 dígitos mostrado no console do servidor.</p>{}\
+<form method=\"post\" action=\"{}\">\
+<input type=\"hidden\" name=\"volta\" value=\"{}\">\
+<input name=\"pin\" inputmode=\"numeric\" pattern=\"[0-9]{{4}}\" maxlength=\"4\" \
+autocomplete=\"off\" autofocus required placeholder=\"0000\">\
+<button>Entrar</button></form>",
+            aviso,
+            ROTA_PIN,
+            escapar_html(volta)
+        ),
+    );
+    // 403, não 200: um curl sem sessão não pode salvar esta página achando que é o arquivo
+    responder_html(s, 403, "Forbidden", &corpo, head)
+}
+
+/// POST do formulário do PIN.
+fn entrar(s: &mut Resposta, req: &Req, cfg: &Config, pin: &Mutex<EstadoPin>) -> io::Result<()> {
+    let chute = campo(&req.corpo, "pin").unwrap_or_default();
+    let volta = destino_seguro(&campo(&req.corpo, "volta").unwrap_or_default());
+
+    let resultado = {
+        let mut est = travar(pin);
+        let r = est.tentar(chute.trim(), Instant::now());
+        match r {
+            Tentativa::Trocado => println!(
+                "{} PIN errado {} vezes: trocado. NOVO PIN: {}",
+                data_log(SystemTime::now()),
+                PIN_MAX_ERROS + 1,
+                est.pin
+            ),
+            // dorme segurando a trava: chutes em paralelo esperam na fila
+            Tentativa::Errado { .. } => thread::sleep(PIN_PAUSA_ERRO),
+            _ => {}
+        }
+        r
+    };
+
+    match resultado {
+        Tentativa::Certo => {
+            let id = gerar_id();
+            travar(&cfg.sessoes).insert(id.clone());
+            let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict", COOKIE, id);
+            enviar_cabecalho(s, 303, "See Other", &[("Set-Cookie", cookie), ("Location", volta)], 0)
+        }
+        Tentativa::Errado { restam } => {
+            let msg = if restam == 1 {
+                "PIN incorreto. Mais 1 erro e o PIN será trocado.".to_string()
+            } else {
+                format!("PIN incorreto. Mais {} erros e o PIN será trocado.", restam)
+            };
+            pagina_pin(s, &msg, &volta, false)
+        }
+        Tentativa::Trocado => pagina_pin(
+            s,
+            &format!(
+                "PIN incorreto {} vezes. Um novo PIN foi gerado: veja no console do servidor \
+e tente de novo em {} segundos.",
+                PIN_MAX_ERROS + 1,
+                PIN_BLOQUEIO.as_secs()
+            ),
+            &volta,
+            false,
+        ),
+        Tentativa::Bloqueado(falta) => pagina_pin(
+            s,
+            &format!(
+                "Muitas tentativas erradas. Aguarde {} segundos e use o novo PIN do console.",
+                falta.as_secs() + 1
+            ),
+            &volta,
+            false,
+        ),
+    }
 }
 
 // ───────────── download (com suporte a retomar) ─────────────
@@ -527,6 +737,13 @@ fn enviar_arquivo(s: &mut Resposta, arq: &Path, req: &Req, head: bool) -> io::Re
 
 fn processar(s: &mut Resposta, req: &Req, cfg: &Config) -> io::Result<()> {
     let head = req.metodo == "HEAD";
+    let bruto = req.alvo.split(['?', '#']).next().unwrap_or("");
+    if let Some(pin) = &cfg.pin
+        && req.metodo == "POST"
+        && bruto == ROTA_PIN
+    {
+        return entrar(s, req, cfg, pin);
+    }
     if req.metodo != "GET" && !head {
         return enviar_cabecalho(
             s,
@@ -537,37 +754,13 @@ fn processar(s: &mut Resposta, req: &Req, cfg: &Config) -> io::Result<()> {
         );
     }
 
-    // Token: vale pela query (?t=...) ou pelo cookie que a primeira visita grava.
-    let mut veio_na_query = false;
-    if let Some(tok) = &cfg.token {
-        veio_na_query = parametro(&req.alvo, "t").is_some_and(|v| iguais(&v, tok));
-        let veio_no_cookie = req
-            .cookie
-            .as_deref()
-            .and_then(|c| valor_cookie(c, COOKIE))
-            .is_some_and(|v| iguais(v, tok));
-        if !veio_na_query && !veio_no_cookie {
-            return erro(
-                s,
-                403,
-                "Forbidden",
-                "Token ausente ou inválido. Use o endereço completo (com ?t=...) mostrado ao iniciar o servidor.",
-                head,
-            );
-        }
+    // Sem sessão: pede o PIN e depois volta para o que foi pedido.
+    if cfg.pin.is_some() && !sessao_valida(req, cfg) {
+        return pagina_pin(s, "", &destino_seguro(bruto), head);
     }
 
     let raiz = cfg.raiz.as_path();
-    let bruto = req.alvo.split(['?', '#']).next().unwrap_or("");
     match resolver(&req.alvo, raiz) {
-        // Navegador entrando com ?t=: grava o cookie e tira o token da barra de
-        // endereço. Arquivos com ?t= são servidos direto (curl/wget não guardam cookie).
-        Some(p) if p.is_dir() && veio_na_query => {
-            let tok = cfg.token.as_deref().unwrap_or_default();
-            let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict", COOKIE, tok);
-            let destino = url_da_pasta(&p, raiz);
-            enviar_cabecalho(s, 303, "See Other", &[("Set-Cookie", cookie), ("Location", destino)], 0)
-        }
         Some(p) if p.is_dir() => listar(s, &p, raiz, bruto, head),
         Some(p) if p.is_file() => enviar_arquivo(s, &p, req, head),
         _ => erro(s, 404, "Not Found", "Não encontrado.", head),
@@ -582,7 +775,6 @@ fn atender(s: TcpStream, cfg: &Config) {
     let mut r = Resposta { s, status: 0, corpo: 0 };
     let resultado = processar(&mut r, &req, cfg);
 
-    // caminho sem a query, para o token nunca ir parar no log
     let bruto = req.alvo.split(['?', '#']).next().unwrap_or("");
     let caminho = decodificar_url(bruto).unwrap_or_else(|| bruto.to_string());
     println!(
@@ -601,7 +793,7 @@ fn atender(s: TcpStream, cfg: &Config) {
 // ───────────── main ─────────────
 
 fn uso() -> ! {
-    eprintln!("Uso: disponibilizador [--host IP] [--porta N] [--token VALOR|auto]");
+    eprintln!("Uso: disponibilizador [--host IP] [--porta N] [--sem-pin]");
     std::process::exit(2);
 }
 
@@ -614,24 +806,15 @@ fn ip_local() -> Option<String> {
 fn main() {
     let mut host = "0.0.0.0".to_string();
     let mut porta: u16 = 8000;
-    let mut token: Option<String> = None;
+    let mut com_pin = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or_else(|| uso()),
             "--porta" => porta = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| uso()),
-            "--token" => token = Some(args.next().unwrap_or_else(|| uso())),
+            "--sem-pin" => com_pin = false,
             _ => uso(),
         }
-    }
-    if token.as_deref() == Some("auto") {
-        token = Some(gerar_token());
-    }
-    if let Some(t) = &token
-        && !token_valido(t)
-    {
-        eprintln!("Token inválido: use só letras, números, '-', '_', '.' ou '~'.");
-        std::process::exit(2);
     }
 
     let pasta = PathBuf::from(PASTA);
@@ -649,25 +832,32 @@ fn main() {
         }
     };
 
-    let sufixo = token.as_deref().map(|t| format!("?t={}", t)).unwrap_or_default();
+    let pin = com_pin.then(EstadoPin::novo);
     println!("Servindo SOMENTE: {}", raiz.display());
     println!("Acesse da VM em:");
     if host == "0.0.0.0" {
         match ip_local() {
-            Some(ip) => println!("   http://{}:{}/{}", ip, porta, sufixo),
-            None => println!("   http://<ip-desta-maquina>:{}/{}", porta, sufixo),
+            Some(ip) => println!("   http://{}:{}/", ip, porta),
+            None => println!("   http://<ip-desta-maquina>:{}/", porta),
         }
     } else {
-        println!("   http://{}:{}/{}", host, porta, sufixo);
+        println!("   http://{}:{}/", host, porta);
     }
-    if host == "0.0.0.0" && token.is_none() {
-        println!("\nAVISO: escutando em todas as interfaces e sem token.");
-        println!("       Qualquer máquina desta rede pode baixar os arquivos.");
-        println!("       Em rede que não é sua, use --token auto ou --host <IP da interface da VM>.");
+    match &pin {
+        Some(p) => println!(
+            "\nPIN DE ACESSO: {}   (troca depois de {} erros; o novo aparece aqui)",
+            p.pin,
+            PIN_MAX_ERROS + 1
+        ),
+        None if host == "0.0.0.0" => {
+            println!("\nAVISO: sem PIN e escutando em todas as interfaces.");
+            println!("       Qualquer máquina desta rede pode baixar os arquivos.");
+        }
+        None => {}
     }
     println!("Ctrl+C para parar.\n");
 
-    let cfg = Arc::new(Config { raiz, token });
+    let cfg = Arc::new(Config { raiz, pin: pin.map(Mutex::new), sessoes: Mutex::new(HashSet::new()) });
     for conn in listener.incoming() {
         let Ok(s) = conn else { continue };
         if ATIVAS.fetch_add(1, Ordering::SeqCst) >= MAX_CONEXOES {
@@ -820,23 +1010,65 @@ mod tests {
     }
 
     #[test]
-    fn token() {
-        assert_eq!(parametro("/?t=abc", "t").as_deref(), Some("abc"));
-        assert_eq!(parametro("/pasta/?x=1&t=a%2Db", "t").as_deref(), Some("a-b"));
-        assert_eq!(parametro("/?tt=abc", "t"), None);
-        assert_eq!(parametro("/", "t"), None);
-        assert_eq!(valor_cookie("a=1; token_disponibilizador=xyz", COOKIE), Some("xyz"));
-        assert_eq!(valor_cookie("xtoken_disponibilizador=xyz", COOKIE), None);
-        assert!(iguais("abc", "abc"));
-        assert!(!iguais("abc", "abd"));
-        assert!(!iguais("abc", "abcd"));
-        assert!(token_valido("Segredo-123_x.y~z"));
-        assert!(!token_valido(""));
-        assert!(!token_valido("com espaço"));
-        assert!(!token_valido("a;b"));
-        let (a, b) = (gerar_token(), gerar_token());
+    fn formulario_e_cookie() {
+        assert_eq!(campo("pin=1234&volta=%2Fpasta%2F", "pin").as_deref(), Some("1234"));
+        assert_eq!(campo("pin=1234&volta=%2Fpasta%2F", "volta").as_deref(), Some("/pasta/"));
+        assert_eq!(campo("volta=%2Fminha+pasta%2F", "volta").as_deref(), Some("/minha pasta/"));
+        assert_eq!(campo("xpin=1234", "pin"), None);
+        assert_eq!(campo("", "pin"), None);
+        assert_eq!(valor_cookie("a=1; sessao_disponibilizador=xyz", COOKIE), Some("xyz"));
+        assert_eq!(valor_cookie("xsessao_disponibilizador=xyz", COOKIE), None);
+        assert!(iguais("1234", "1234"));
+        assert!(!iguais("1234", "1235"));
+        assert!(!iguais("1234", "12345"));
+    }
+
+    #[test]
+    fn destino_depois_do_pin() {
+        assert_eq!(destino_seguro("/pasta/arq%20x.txt"), "/pasta/arq%20x.txt");
+        assert_eq!(destino_seguro("/"), "/");
+        for ruim in ["", "pasta/", "//evil.com/", "/\\evil.com", "http://evil.com", "/a\r\nSet-Cookie: x", "/a b", ROTA_PIN] {
+            assert_eq!(destino_seguro(ruim), "/", "deveria recusar {ruim:?}");
+        }
+    }
+
+    #[test]
+    fn ids_e_pins_aleatorios() {
+        let (a, b) = (gerar_id(), gerar_id());
         assert_eq!(a.len(), 32);
-        assert!(token_valido(&a));
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+        for _ in 0..200 {
+            let p = gerar_pin(Some("0000"));
+            assert_eq!(p.len(), 4);
+            assert!(p.bytes().all(|c| c.is_ascii_digit()));
+            assert_ne!(p, "0000");
+        }
+    }
+
+    #[test]
+    fn pin_troca_depois_de_errar_demais() {
+        let mut e = EstadoPin { pin: "1234".into(), erros: 0, bloqueado_ate: None };
+        let t0 = Instant::now();
+        assert_eq!(e.tentar("1234", t0), Tentativa::Certo);
+        assert_eq!(e.tentar("0000", t0), Tentativa::Errado { restam: 4 });
+        assert_eq!(e.tentar("", t0), Tentativa::Errado { restam: 3 });
+        assert_eq!(e.tentar("1234", t0), Tentativa::Certo); // acertar não zera os erros
+        assert_eq!(e.tentar("0000", t0), Tentativa::Errado { restam: 2 });
+        assert_eq!(e.tentar("0000", t0), Tentativa::Errado { restam: 1 });
+        assert_eq!(e.tentar("0000", t0), Tentativa::Trocado); // 5º erro
+        assert_ne!(e.pin, "1234");
+        assert_eq!(e.erros, 0);
+
+        // durante o bloqueio nem o PIN novo entra, e o velho também não
+        let novo = e.pin.clone();
+        assert!(matches!(e.tentar(&novo, t0 + Duration::from_secs(10)), Tentativa::Bloqueado(_)));
+        assert!(matches!(e.tentar("1234", t0 + Duration::from_secs(29)), Tentativa::Bloqueado(_)));
+        assert_eq!(e.erros, 0, "tentativas no bloqueio não contam");
+
+        // depois do bloqueio: o velho não vale mais, o novo vale
+        let depois = t0 + PIN_BLOQUEIO;
+        assert_eq!(e.tentar("1234", depois), Tentativa::Errado { restam: 4 });
+        assert_eq!(e.tentar(&novo, depois), Tentativa::Certo);
     }
 }
