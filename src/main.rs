@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PASTA: &str = "compartilhar";
 const CHUNK: usize = 256 * 1024;
 const MAX_CONEXOES: usize = 128;
+/// Tempo total para o cliente enviar o cabeçalho inteiro (contra slowloris).
+const PRAZO_CABECALHO: Duration = Duration::from_secs(10);
 static ATIVAS: AtomicUsize = AtomicUsize::new(0);
 
 struct Guarda;
@@ -96,9 +98,28 @@ struct Req {
     range: Option<String>,
 }
 
+/// Leitor que falha quando o prazo total acaba, não importa quão devagar
+/// os bytes cheguem: antes de cada leitura o timeout vira o tempo restante.
+struct ComPrazo<'a> {
+    s: &'a TcpStream,
+    limite: Instant,
+}
+
+impl Read for ComPrazo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let resta = self.limite.saturating_duration_since(Instant::now());
+        if resta.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.s.set_read_timeout(Some(resta))?;
+        self.s.read(buf)
+    }
+}
+
 fn ler_requisicao(stream: &TcpStream) -> Option<Req> {
-    // limita o cabeçalho a 16 KB
-    let mut r = BufReader::new(stream.take(16 * 1024));
+    // limita o cabeçalho a 16 KB e a PRAZO_CABECALHO no total
+    let leitor = ComPrazo { s: stream, limite: Instant::now() + PRAZO_CABECALHO };
+    let mut r = BufReader::new(leitor.take(16 * 1024));
     let mut linha = String::new();
     if r.read_line(&mut linha).ok()? == 0 {
         return None;
@@ -274,6 +295,7 @@ td:last-child{{text-align:right;color:#aaa;white-space:nowrap}}\
 
 // ───────────── download (com suporte a retomar) ─────────────
 
+#[derive(Debug, PartialEq)]
 enum Faixa {
     Inteiro,
     Parcial(u64, u64),
@@ -390,7 +412,6 @@ fn processar(s: &mut TcpStream, req: &Req, raiz: &Path) -> io::Result<()> {
 }
 
 fn atender(mut s: TcpStream, raiz: &Path) {
-    let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(60)));
     let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let Some(req) = ler_requisicao(&s) else { return };
@@ -452,15 +473,125 @@ fn main() {
 
     let raiz = Arc::new(raiz);
     for conn in listener.incoming() {
-        let Ok(s) = conn else { continue };
+        let Ok(mut s) = conn else { continue };
         if ATIVAS.fetch_add(1, Ordering::SeqCst) >= MAX_CONEXOES {
             ATIVAS.fetch_sub(1, Ordering::SeqCst);
-            continue; // descarta (fecha) a conexão
+            // resposta curta, sem ler a requisição, para não travar o loop de aceite
+            let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = erro(&mut s, 503, "Service Unavailable", "Servidor ocupado, tente novamente.", false);
+            continue;
         }
         let raiz = Arc::clone(&raiz);
         thread::spawn(move || {
             let _g = Guarda;
             atender(s, &raiz);
         });
+    }
+}
+
+// ───────────── testes ─────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Monta uma árvore temporária:
+    ///   <tmp>/compartilhar/{a.txt, .oculto, sub/b.txt, minha pasta/c.txt}
+    ///   <tmp>/fora.txt
+    fn arvore(nome: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("disponibilizador-{}-{}", nome, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let raiz = base.join("compartilhar");
+        std::fs::create_dir_all(raiz.join("sub")).unwrap();
+        std::fs::create_dir_all(raiz.join("minha pasta")).unwrap();
+        std::fs::write(raiz.join("a.txt"), "a").unwrap();
+        std::fs::write(raiz.join(".oculto"), "x").unwrap();
+        std::fs::write(raiz.join("sub").join("b.txt"), "b").unwrap();
+        std::fs::write(raiz.join("minha pasta").join("c.txt"), "c").unwrap();
+        std::fs::write(base.join("fora.txt"), "fora").unwrap();
+        raiz.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn resolver_aceita_caminhos_validos() {
+        let raiz = arvore("validos");
+        assert_eq!(resolver("/", &raiz), Some(raiz.clone()));
+        assert_eq!(resolver("/a.txt", &raiz), Some(raiz.join("a.txt")));
+        assert_eq!(resolver("/sub/b.txt", &raiz), Some(raiz.join("sub").join("b.txt")));
+        assert_eq!(resolver("/sub//./b.txt", &raiz), Some(raiz.join("sub").join("b.txt")));
+        assert_eq!(resolver("/minha%20pasta/c.txt", &raiz), Some(raiz.join("minha pasta").join("c.txt")));
+        assert_eq!(resolver("/a.txt?x=1#y", &raiz), Some(raiz.join("a.txt")));
+    }
+
+    #[test]
+    fn resolver_bloqueia_fuga_e_entradas_invalidas() {
+        let raiz = arvore("bloqueios");
+        for alvo in [
+            "a.txt",              // sem barra inicial
+            "/../fora.txt",       // subir de pasta
+            "/sub/../a.txt",      // ".." mesmo voltando para dentro
+            "/%2e%2e/fora.txt",   // ".." codificado
+            "/%2E%2E%2Ffora.txt", // "../" inteiro codificado
+            "/.oculto",           // arquivo oculto
+            "/a.txt%00",          // byte nulo
+            "/sub%5Cb.txt",       // barra invertida
+            "/C:/Windows",        // letra de unidade
+            "/a.txt:stream",      // ADS do NTFS
+            "/%zz",               // % inválido
+            "/%4",                // % incompleto
+            "/%FF",               // UTF-8 inválido
+            "/nao_existe",
+        ] {
+            assert_eq!(resolver(alvo, &raiz), None, "deveria bloquear {alvo:?}");
+        }
+    }
+
+    #[test]
+    fn resolver_bloqueia_link_simbolico_para_fora() {
+        let raiz = arvore("symlink");
+        let fora = raiz.parent().unwrap().join("fora.txt");
+        let link = raiz.join("atalho.txt");
+        #[cfg(unix)]
+        let criado = std::os::unix::fs::symlink(&fora, &link);
+        #[cfg(windows)]
+        let criado = std::os::windows::fs::symlink_file(&fora, &link);
+        if criado.is_err() {
+            // no Windows criar symlink exige admin ou modo desenvolvedor
+            eprintln!("symlink não criado; teste ignorado");
+            return;
+        }
+        assert_eq!(resolver("/atalho.txt", &raiz), None);
+    }
+
+    #[test]
+    fn faixas() {
+        use Faixa::*;
+        let f = |h: Option<&str>, tam| parse_faixa(h, tam);
+        assert_eq!(f(None, 100), Inteiro);
+        assert_eq!(f(Some("bytes=0-"), 100), Parcial(0, 99));
+        assert_eq!(f(Some("bytes=10-19"), 100), Parcial(10, 19));
+        assert_eq!(f(Some(" bytes=10-19 "), 100), Parcial(10, 19));
+        assert_eq!(f(Some("bytes=90-500"), 100), Parcial(90, 99));
+        assert_eq!(f(Some("bytes=-10"), 100), Parcial(90, 99));
+        assert_eq!(f(Some("bytes=-500"), 100), Parcial(0, 99));
+        assert_eq!(f(Some("bytes=-0"), 100), Invalida);
+        assert_eq!(f(Some("bytes=100-"), 100), Invalida);
+        assert_eq!(f(Some("bytes=5-2"), 100), Invalida);
+        assert_eq!(f(Some("bytes=0-"), 0), Invalida);
+        assert_eq!(f(Some("bytes=-5"), 0), Invalida);
+        // formatos não suportados caem para o arquivo inteiro
+        assert_eq!(f(Some("bytes=a-b"), 100), Inteiro);
+        assert_eq!(f(Some("bytes=0-1,5-6"), 100), Inteiro);
+        assert_eq!(f(Some("items=0-1"), 100), Inteiro);
+    }
+
+    #[test]
+    fn url_ida_e_volta() {
+        assert_eq!(decodificar_url("/a%20b/%C3%A9"), Some("/a b/é".into()));
+        assert_eq!(decodificar_url("%e9"), None); // byte solto não é UTF-8
+        assert_eq!(decodificar_url("a%2"), None);
+        assert_eq!(codificar_url("minha pasta/é.txt"), "minha%20pasta%2F%C3%A9.txt");
+        let nome = "relatório (final) & cia.pdf";
+        assert_eq!(decodificar_url(&codificar_url(nome)).as_deref(), Some(nome));
     }
 }
