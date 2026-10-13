@@ -9,21 +9,26 @@
 //!   cargo run --release
 //!   cargo run --release -- --porta 9000
 //!   cargo run --release -- --host 192.168.56.1   (escutar só em uma interface)
+//!   cargo run --release -- --token auto          (exige token; gera um aleatório)
+//!   cargo run --release -- --token segredo123    (exige este token)
 
+use std::collections::hash_map::RandomState;
 use std::fs::File;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PASTA: &str = "compartilhar";
 const CHUNK: usize = 256 * 1024;
 const MAX_CONEXOES: usize = 128;
 /// Tempo total para o cliente enviar o cabeçalho inteiro (contra slowloris).
 const PRAZO_CABECALHO: Duration = Duration::from_secs(10);
+const COOKIE: &str = "token_disponibilizador";
 static ATIVAS: AtomicUsize = AtomicUsize::new(0);
 
 struct Guarda;
@@ -90,12 +95,105 @@ fn tamanho_legivel(n: u64) -> String {
     }
 }
 
+/// Decompõe um instante em UTC: (ano, mês, dia, hora, min, seg, dia da semana 0=dom).
+/// Algoritmo "civil_from_days" de Howard Hinnant.
+fn data_utc(t: SystemTime) -> (i64, u32, u32, u32, u32, u32, usize) {
+    let seg = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let (dias, resto) = (seg.div_euclid(86400), seg.rem_euclid(86400));
+    let semana = (dias + 4).rem_euclid(7) as usize; // 1970-01-01 foi quinta
+    let z = dias + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dia = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mes = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let ano = yoe + era * 400 + i64::from(mes <= 2);
+    let r = resto as u32;
+    (ano, mes, dia, r / 3600, r / 60 % 60, r % 60, semana)
+}
+
+/// Formato de data do HTTP: "Thu, 29 Feb 2024 00:00:00 GMT".
+fn data_http(t: SystemTime) -> String {
+    const DIAS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MESES: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (a, m, d, h, mi, s, sem) = data_utc(t);
+    format!("{}, {:02} {} {} {:02}:{:02}:{:02} GMT", DIAS[sem], d, MESES[m as usize - 1], a, h, mi, s)
+}
+
+/// Data para o log (UTC, a biblioteca padrão não conhece o fuso local).
+fn data_log(t: SystemTime) -> String {
+    let (a, m, d, h, mi, s, _) = data_utc(t);
+    format!("{}-{:02}-{:02} {:02}:{:02}:{:02}Z", a, m, d, h, mi, s)
+}
+
+/// Comparação em tempo constante (não revela quantos caracteres batem).
+fn iguais(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Só caracteres que dispensam escape em URL e em cookie.
+fn token_valido(t: &str) -> bool {
+    !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+}
+
+/// 32 caracteres hex imprevisíveis. Cada `RandomState` nasce com chaves
+/// SipHash sorteadas pelo sistema operacional, então o hash é aleatório.
+fn gerar_token() -> String {
+    (0..2)
+        .map(|_| format!("{:016x}", RandomState::new().build_hasher().finish()))
+        .collect()
+}
+
+/// Valor de um parâmetro da query string (`?t=...`), já decodificado.
+fn parametro(alvo: &str, nome: &str) -> Option<String> {
+    let query = alvo.split_once('?')?.1.split('#').next()?;
+    query
+        .split('&')
+        .find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == nome).map(|(_, v)| v))
+        .and_then(decodificar_url)
+}
+
+/// Valor de um cookie dentro do cabeçalho `Cookie: a=1; b=2`.
+fn valor_cookie<'a>(cabecalho: &'a str, nome: &str) -> Option<&'a str> {
+    cabecalho
+        .split(';')
+        .find_map(|p| p.trim().split_once('=').filter(|(k, _)| *k == nome).map(|(_, v)| v))
+}
+
 // ───────────── HTTP básico ─────────────
 
 struct Req {
     metodo: String,
     alvo: String,
     range: Option<String>,
+    if_range: Option<String>,
+    cookie: Option<String>,
+}
+
+/// Lado de saída da conexão. Lembra o status e conta os bytes do corpo, para o log.
+struct Resposta {
+    s: TcpStream,
+    status: u16,
+    corpo: u64,
+}
+
+impl Write for Resposta {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.s.write(buf)?;
+        self.corpo += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.s.flush()
+    }
+}
+
+/// Configuração compartilhada entre as threads.
+struct Config {
+    raiz: PathBuf,
+    token: Option<String>,
 }
 
 /// Leitor que falha quando o prazo total acaba, não importa quão devagar
@@ -127,7 +225,7 @@ fn ler_requisicao(stream: &TcpStream) -> Option<Req> {
     let mut p = linha.split_whitespace();
     let metodo = p.next()?.to_string();
     let alvo = p.next()?.to_string();
-    let mut range = None;
+    let (mut range, mut if_range, mut cookie) = (None, None, None);
     for _ in 0..100 {
         let mut h = String::new();
         if r.read_line(&mut h).ok()? == 0 {
@@ -135,19 +233,22 @@ fn ler_requisicao(stream: &TcpStream) -> Option<Req> {
         }
         let h = h.trim_end();
         if h.is_empty() {
-            return Some(Req { metodo, alvo, range });
+            return Some(Req { metodo, alvo, range, if_range, cookie });
         }
-        if let Some((k, v)) = h.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("range") {
-                range = Some(v.trim().to_string());
-            }
+        let Some((k, v)) = h.split_once(':') else { continue };
+        let v = Some(v.trim().to_string());
+        match k.trim().to_ascii_lowercase().as_str() {
+            "range" => range = v,
+            "if-range" => if_range = v,
+            "cookie" => cookie = v,
+            _ => {}
         }
     }
     None
 }
 
 fn enviar_cabecalho(
-    s: &mut TcpStream,
+    s: &mut Resposta,
     codigo: u16,
     razao: &str,
     extras: &[(&str, String)],
@@ -162,10 +263,11 @@ fn enviar_cabecalho(
         h.push_str(&format!("{}: {}\r\n", k, v));
     }
     h.push_str("\r\n");
-    s.write_all(h.as_bytes())
+    s.status = codigo;
+    s.s.write_all(h.as_bytes()) // direto no socket: cabeçalho não conta como corpo
 }
 
-fn responder_html(s: &mut TcpStream, codigo: u16, razao: &str, corpo: &str, head: bool) -> io::Result<()> {
+fn responder_html(s: &mut Resposta, codigo: u16, razao: &str, corpo: &str, head: bool) -> io::Result<()> {
     enviar_cabecalho(
         s,
         codigo,
@@ -179,7 +281,7 @@ fn responder_html(s: &mut TcpStream, codigo: u16, razao: &str, corpo: &str, head
     Ok(())
 }
 
-fn erro(s: &mut TcpStream, codigo: u16, razao: &str, msg: &str, head: bool) -> io::Result<()> {
+fn erro(s: &mut Resposta, codigo: u16, razao: &str, msg: &str, head: bool) -> io::Result<()> {
     let corpo = format!("<h1>{} {}</h1><p>{}</p>", codigo, razao, escapar_html(msg));
     responder_html(s, codigo, razao, &corpo, head)
 }
@@ -227,7 +329,7 @@ fn url_da_pasta(dir: &Path, raiz: &Path) -> String {
 
 // ───────────── listagem ─────────────
 
-fn listar(s: &mut TcpStream, dir: &Path, raiz: &Path, bruto: &str, head: bool) -> io::Result<()> {
+fn listar(s: &mut Resposta, dir: &Path, raiz: &Path, bruto: &str, head: bool) -> io::Result<()> {
     let url = url_da_pasta(dir, raiz);
     if bruto != url {
         return enviar_cabecalho(s, 301, "Moved Permanently", &[("Location", url)], 0);
@@ -334,12 +436,41 @@ fn parse_faixa(h: Option<&str>, tam: u64) -> Faixa {
     }
 }
 
-fn enviar_arquivo(s: &mut TcpStream, arq: &Path, range: Option<&str>, head: bool) -> io::Result<()> {
+/// ETag forte derivada de tamanho + data de modificação: muda se o arquivo mudar.
+fn etag(tam: u64, modificado: SystemTime) -> String {
+    let ns = modificado.duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("\"{:x}-{:x}\"", tam, ns)
+}
+
+/// `If-Range` diz "só me mande a faixa se o arquivo ainda for este".
+/// Sem o cabeçalho a faixa vale; com ele, precisa bater com a ETag (comparação
+/// forte, então ETag fraca `W/` nunca bate) ou com o Last-Modified exato.
+fn if_range_confere(if_range: Option<&str>, etag: &str, ultima: &str) -> bool {
+    let Some(v) = if_range.map(str::trim) else { return true };
+    if v.starts_with('"') {
+        v == etag
+    } else if v.starts_with("W/") {
+        false
+    } else {
+        v == ultima
+    }
+}
+
+fn enviar_arquivo(s: &mut Resposta, arq: &Path, req: &Req, head: bool) -> io::Result<()> {
     let mut f = match File::open(arq) {
         Ok(f) => f,
         Err(_) => return erro(s, 403, "Forbidden", "Sem permissão.", head),
     };
-    let tam = f.metadata()?.len();
+    let meta = f.metadata()?;
+    let tam = meta.len();
+    let modificado = meta.modified().unwrap_or(UNIX_EPOCH);
+    let etag = etag(tam, modificado);
+    let ultima = data_http(modificado);
+    // arquivo mudou desde o download parcial → manda inteiro em vez de emendar errado
+    let range = req
+        .range
+        .as_deref()
+        .filter(|_| if_range_confere(req.if_range.as_deref(), &etag, &ultima));
     let nome = arq
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -352,6 +483,8 @@ fn enviar_arquivo(s: &mut TcpStream, arq: &Path, range: Option<&str>, head: bool
             format!("attachment; filename*=UTF-8''{}", codificar_url(&nome)),
         ),
         ("Accept-Ranges", "bytes".to_string()),
+        ("ETag", etag),
+        ("Last-Modified", ultima),
     ];
 
     let (ini, fim, codigo, razao): (u64, u64, u16, &str) = match parse_faixa(range, tam) {
@@ -392,7 +525,7 @@ fn enviar_arquivo(s: &mut TcpStream, arq: &Path, range: Option<&str>, head: bool
 
 // ───────────── conexão ─────────────
 
-fn processar(s: &mut TcpStream, req: &Req, raiz: &Path) -> io::Result<()> {
+fn processar(s: &mut Resposta, req: &Req, cfg: &Config) -> io::Result<()> {
     let head = req.metodo == "HEAD";
     if req.metodo != "GET" && !head {
         return enviar_cabecalho(
@@ -403,26 +536,72 @@ fn processar(s: &mut TcpStream, req: &Req, raiz: &Path) -> io::Result<()> {
             0,
         );
     }
+
+    // Token: vale pela query (?t=...) ou pelo cookie que a primeira visita grava.
+    let mut veio_na_query = false;
+    if let Some(tok) = &cfg.token {
+        veio_na_query = parametro(&req.alvo, "t").is_some_and(|v| iguais(&v, tok));
+        let veio_no_cookie = req
+            .cookie
+            .as_deref()
+            .and_then(|c| valor_cookie(c, COOKIE))
+            .is_some_and(|v| iguais(v, tok));
+        if !veio_na_query && !veio_no_cookie {
+            return erro(
+                s,
+                403,
+                "Forbidden",
+                "Token ausente ou inválido. Use o endereço completo (com ?t=...) mostrado ao iniciar o servidor.",
+                head,
+            );
+        }
+    }
+
+    let raiz = cfg.raiz.as_path();
     let bruto = req.alvo.split(['?', '#']).next().unwrap_or("");
     match resolver(&req.alvo, raiz) {
+        // Navegador entrando com ?t=: grava o cookie e tira o token da barra de
+        // endereço. Arquivos com ?t= são servidos direto (curl/wget não guardam cookie).
+        Some(p) if p.is_dir() && veio_na_query => {
+            let tok = cfg.token.as_deref().unwrap_or_default();
+            let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict", COOKIE, tok);
+            let destino = url_da_pasta(&p, raiz);
+            enviar_cabecalho(s, 303, "See Other", &[("Set-Cookie", cookie), ("Location", destino)], 0)
+        }
         Some(p) if p.is_dir() => listar(s, &p, raiz, bruto, head),
-        Some(p) if p.is_file() => enviar_arquivo(s, &p, req.range.as_deref(), head),
+        Some(p) if p.is_file() => enviar_arquivo(s, &p, req, head),
         _ => erro(s, 404, "Not Found", "Não encontrado.", head),
     }
 }
 
-fn atender(mut s: TcpStream, raiz: &Path) {
+fn atender(s: TcpStream, cfg: &Config) {
+    let inicio = Instant::now();
     let _ = s.set_write_timeout(Some(Duration::from_secs(60)));
     let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let Some(req) = ler_requisicao(&s) else { return };
-    println!("[{}] {} {:?}", peer, req.metodo, req.alvo);
-    let _ = processar(&mut s, &req, raiz);
+    let mut r = Resposta { s, status: 0, corpo: 0 };
+    let resultado = processar(&mut r, &req, cfg);
+
+    // caminho sem a query, para o token nunca ir parar no log
+    let bruto = req.alvo.split(['?', '#']).next().unwrap_or("");
+    let caminho = decodificar_url(bruto).unwrap_or_else(|| bruto.to_string());
+    println!(
+        "{} {} {} {:?} {} {} {:.1}s{}",
+        data_log(SystemTime::now()),
+        peer,
+        req.metodo,
+        caminho,
+        r.status,
+        tamanho_legivel(r.corpo),
+        inicio.elapsed().as_secs_f64(),
+        if resultado.is_err() { " (interrompido)" } else { "" }
+    );
 }
 
 // ───────────── main ─────────────
 
 fn uso() -> ! {
-    eprintln!("Uso: disponibilizador [--host IP] [--porta N]");
+    eprintln!("Uso: disponibilizador [--host IP] [--porta N] [--token VALOR|auto]");
     std::process::exit(2);
 }
 
@@ -435,13 +614,24 @@ fn ip_local() -> Option<String> {
 fn main() {
     let mut host = "0.0.0.0".to_string();
     let mut porta: u16 = 8000;
+    let mut token: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--host" => host = args.next().unwrap_or_else(|| uso()),
             "--porta" => porta = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| uso()),
+            "--token" => token = Some(args.next().unwrap_or_else(|| uso())),
             _ => uso(),
         }
+    }
+    if token.as_deref() == Some("auto") {
+        token = Some(gerar_token());
+    }
+    if let Some(t) = &token
+        && !token_valido(t)
+    {
+        eprintln!("Token inválido: use só letras, números, '-', '_', '.' ou '~'.");
+        std::process::exit(2);
     }
 
     let pasta = PathBuf::from(PASTA);
@@ -459,32 +649,41 @@ fn main() {
         }
     };
 
+    let sufixo = token.as_deref().map(|t| format!("?t={}", t)).unwrap_or_default();
     println!("Servindo SOMENTE: {}", raiz.display());
     println!("Acesse da VM em:");
     if host == "0.0.0.0" {
         match ip_local() {
-            Some(ip) => println!("   http://{}:{}/", ip, porta),
-            None => println!("   http://<ip-desta-maquina>:{}/", porta),
+            Some(ip) => println!("   http://{}:{}/{}", ip, porta, sufixo),
+            None => println!("   http://<ip-desta-maquina>:{}/{}", porta, sufixo),
         }
     } else {
-        println!("   http://{}:{}/", host, porta);
+        println!("   http://{}:{}/{}", host, porta, sufixo);
+    }
+    if host == "0.0.0.0" && token.is_none() {
+        println!("\nAVISO: escutando em todas as interfaces e sem token.");
+        println!("       Qualquer máquina desta rede pode baixar os arquivos.");
+        println!("       Em rede que não é sua, use --token auto ou --host <IP da interface da VM>.");
     }
     println!("Ctrl+C para parar.\n");
 
-    let raiz = Arc::new(raiz);
+    let cfg = Arc::new(Config { raiz, token });
     for conn in listener.incoming() {
-        let Ok(mut s) = conn else { continue };
+        let Ok(s) = conn else { continue };
         if ATIVAS.fetch_add(1, Ordering::SeqCst) >= MAX_CONEXOES {
             ATIVAS.fetch_sub(1, Ordering::SeqCst);
             // resposta curta, sem ler a requisição, para não travar o loop de aceite
             let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
-            let _ = erro(&mut s, 503, "Service Unavailable", "Servidor ocupado, tente novamente.", false);
+            let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+            let mut r = Resposta { s, status: 0, corpo: 0 };
+            let _ = erro(&mut r, 503, "Service Unavailable", "Servidor ocupado, tente novamente.", false);
+            println!("{} {} 503 (limite de {} conexões)", data_log(SystemTime::now()), peer, MAX_CONEXOES);
             continue;
         }
-        let raiz = Arc::clone(&raiz);
+        let cfg = Arc::clone(&cfg);
         thread::spawn(move || {
             let _g = Guarda;
-            atender(s, &raiz);
+            atender(s, &cfg);
         });
     }
 }
@@ -593,5 +792,51 @@ mod tests {
         assert_eq!(codificar_url("minha pasta/é.txt"), "minha%20pasta%2F%C3%A9.txt");
         let nome = "relatório (final) & cia.pdf";
         assert_eq!(decodificar_url(&codificar_url(nome)).as_deref(), Some(nome));
+    }
+
+    #[test]
+    fn datas() {
+        let t = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        assert_eq!(data_http(UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(data_http(t(951_782_400)), "Tue, 29 Feb 2000 00:00:00 GMT");
+        assert_eq!(data_http(t(1_709_164_800)), "Thu, 29 Feb 2024 00:00:00 GMT");
+        assert_eq!(data_http(t(4_102_444_799)), "Thu, 31 Dec 2099 23:59:59 GMT");
+        assert_eq!(data_log(t(1_709_164_800 + 3661)), "2024-02-29 01:01:01Z");
+    }
+
+    #[test]
+    fn if_range() {
+        let (etag, ultima) = ("\"a-1f\"", "Thu, 29 Feb 2024 00:00:00 GMT");
+        assert!(if_range_confere(None, etag, ultima));
+        assert!(if_range_confere(Some("\"a-1f\""), etag, ultima));
+        assert!(if_range_confere(Some(ultima), etag, ultima));
+        assert!(!if_range_confere(Some("\"a-20\""), etag, ultima)); // arquivo mudou
+        assert!(!if_range_confere(Some("W/\"a-1f\""), etag, ultima)); // ETag fraca
+        assert!(!if_range_confere(Some("Fri, 01 Mar 2024 00:00:00 GMT"), etag, ultima));
+        // a ETag muda quando muda o tamanho ou a data
+        let m = UNIX_EPOCH + Duration::from_secs(1000);
+        assert_ne!(super::etag(10, m), super::etag(11, m));
+        assert_ne!(super::etag(10, m), super::etag(10, m + Duration::from_micros(1)));
+    }
+
+    #[test]
+    fn token() {
+        assert_eq!(parametro("/?t=abc", "t").as_deref(), Some("abc"));
+        assert_eq!(parametro("/pasta/?x=1&t=a%2Db", "t").as_deref(), Some("a-b"));
+        assert_eq!(parametro("/?tt=abc", "t"), None);
+        assert_eq!(parametro("/", "t"), None);
+        assert_eq!(valor_cookie("a=1; token_disponibilizador=xyz", COOKIE), Some("xyz"));
+        assert_eq!(valor_cookie("xtoken_disponibilizador=xyz", COOKIE), None);
+        assert!(iguais("abc", "abc"));
+        assert!(!iguais("abc", "abd"));
+        assert!(!iguais("abc", "abcd"));
+        assert!(token_valido("Segredo-123_x.y~z"));
+        assert!(!token_valido(""));
+        assert!(!token_valido("com espaço"));
+        assert!(!token_valido("a;b"));
+        let (a, b) = (gerar_token(), gerar_token());
+        assert_eq!(a.len(), 32);
+        assert!(token_valido(&a));
+        assert_ne!(a, b);
     }
 }
